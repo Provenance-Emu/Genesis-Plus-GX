@@ -37,6 +37,7 @@
  ****************************************************************************************/
 
 #include "shared.h"
+#include <stddef.h>
 
 /*--------------------------------------------------------------------------*/
 /* Unused area (return open bus data, i.e prefetched instruction word)      */
@@ -2100,6 +2101,59 @@ int scd_context_save(uint8 *state)
   return bufferptr;
 }
 
+/* CDC hardware layout as saved raw (save_param(&cdc, sizeof(cdc))) by version 1.7.5 states.
+   Its size depends on the saving build's pointer size: on 64-bit builds, 4 bytes of alignment
+   padding follow 'cycles' and 'dma_w' is an 8-byte function pointer, so the block is 8 bytes
+   longer than the field-by-field layout read by cdc_context_load(). */
+typedef struct
+{
+  uint8 ifstat;
+  uint8 ifctrl;
+  reg16_t dbc;
+  reg16_t dac;
+  reg16_t pt;
+  reg16_t wa;
+  uint8 ctrl[2];
+  uint8 head[2][4];
+  uint8 stat[4];
+  int cycles;
+  void (*dma_w)(unsigned int words);  /* meaningless once saved (DMA callback is restored from the following byte) */
+  uint8 ram[0x4000 + 2352];
+} cdc_v175_t;
+
+/* registers preceding the cycle counter are saved identically by both formats */
+typedef char cdc_v175_head_check[(offsetof(cdc_v175_t, cycles) == offsetof(cdc_t, cycles)) ? 1 : -1];
+typedef char cdc_v175_ram_check[(sizeof(((cdc_v175_t *)0)->ram) == sizeof(cdc.ram)) ? 1 : -1];
+typedef char cdc_v175_cycles_check[(sizeof(cdc.cycles) == 2 * sizeof(int)) ? 1 : -1];
+
+/* convert a 1.7.5 CDC block (raw cdc_t + DMA destination byte) to the current format then load it */
+static int cdc_context_load_v175(uint8 *state)
+{
+  static uint8 converted[offsetof(cdc_v175_t, cycles) + 2 * sizeof(int) + sizeof(((cdc_v175_t *)0)->ram) + 1];
+  int cycles[2];
+  int bufferptr = offsetof(cdc_v175_t, cycles);
+
+  /* CDC registers */
+  memcpy(converted, state, bufferptr);
+
+  /* single 1.7.5 cycle counter is the DMA counter, decoder counter restarts as on reset */
+  memcpy(&cycles[0], state + offsetof(cdc_v175_t, cycles), sizeof(int));
+  cycles[1] = 0;
+  memcpy(converted + bufferptr, cycles, sizeof(cycles));
+  bufferptr += sizeof(cycles);
+
+  /* CDC RAM (skipping saved padding and DMA callback pointer) */
+  memcpy(converted + bufferptr, state + offsetof(cdc_v175_t, ram), sizeof(((cdc_v175_t *)0)->ram));
+  bufferptr += sizeof(((cdc_v175_t *)0)->ram);
+
+  /* DMA destination (same encoding in both versions) */
+  converted[bufferptr] = state[sizeof(cdc_v175_t)];
+
+  cdc_context_load(converted);
+
+  return sizeof(cdc_v175_t) + 1;
+}
+
 int scd_context_load(uint8 *state, char *version)
 {
   int i;
@@ -2119,7 +2173,15 @@ int scd_context_load(uint8 *state, char *version)
   bufferptr += gfx_context_load(&state[bufferptr]);
 
   /* CD Data controller */
-  bufferptr += cdc_context_load(&state[bufferptr]);
+  if ((version[11] == 0x31) && (version[13] == 0x37) && (version[15] == 0x35))
+  {
+    /* support for previous state version (1.7.5) */
+    bufferptr += cdc_context_load_v175(&state[bufferptr]);
+  }
+  else
+  {
+    bufferptr += cdc_context_load(&state[bufferptr]);
+  }
 
   /* CD Drive processor */
   bufferptr += cdd_context_load(&state[bufferptr], version);
